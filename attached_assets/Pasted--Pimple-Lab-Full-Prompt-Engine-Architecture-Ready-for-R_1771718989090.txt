@@ -1,0 +1,883 @@
+ Pimple Lab — Full Prompt & Engine Architecture
+Ready for Replit MVP · Hackathon Deadline: 23 Feb 17:00 UTC
+⚡ PART 0: Token Decision
+Use max_new_tokens: 300.
+
+Here's why:
+
+
+Tokens	Est. Time (L4 GPU)	Room for Output	Risk
+200	~25–30s	JSON barely fits, no message field	High truncation
+300	~35–45s	JSON + message + hypothesis fits	Low — recommended
+400	~55–65s	Lots of room	Borderline UX
+500	>70s	Comfortable	Too slow
+Loading screen copy: "Running your skin science... usually about 30 seconds 🧪" — sets expectation, feels intentional.
+
+JSON-first strategy: Instruct MedGemma to output { immediately. If truncation hits, you lose the tail of the message field — but the classification fields at the top survive. Parser handles truncated JSON gracefully.
+
+📷 PART 1: Photo Capture Guidance
+UX spec: Maximum 3 attempts per session. User selects best. ONE photo sent to MedGemma.
+
+Photo Instructions (show on screen before capture):
+📸 Getting a good photo makes a big difference
+
+✅ Face a window or bright lamp (natural light is best)
+✅ No makeup on the area you want to check
+✅ Hold your phone about 30cm (one ruler-length) from your face
+✅ Centre your face / affected area in the frame
+✅ Stay still — blurry photos get worse results
+✅ Take up to 3 photos and pick the sharpest one
+
+❌ Avoid: flash, dim lighting, dark backgrounds, filters
+❌ If checking chest or back, get someone to help you angle the camera
+Photo Attempt Flow (3 max):
+Attempt 1 → Preview → "Use this" or "Retake"
+Attempt 2 → Preview → "Use this" or "Retake"
+Attempt 3 → Preview → "Use this" (no retake option — must proceed)
+Auto-warning trigger: if image appears very dark (average pixel brightness < 60/255), show: "This photo looks a bit dark. Try facing a brighter light if you can."
+What gets sent to MedGemma:
+The selected photo, resized server-side to 512×512, compressed to 70% JPEG, encoded as base64 ✅
+ONE photo per analysis call ✅
+📋 PART 2: Intake Form Specification
+Collect ALL of this before the photo is taken. Pass it all into the MedGemma prompt as structured text.
+
+javascript
+// INTAKE FORM SCHEMA
+const intakeSchema = {
+  // Screen 1 — About You
+  age: Number,                    // 12–19 (enforce range)
+  biological_sex: "male" | "female" | "prefer_not_to_say",
+  
+  // Screen 2 — Your Skin Right Now
+  concern_zones: Array,           // Multi-select: ["forehead","left_cheek","right_cheek",
+                                  //   "chin","nose_tzone","chest","back","shoulders"]
+  duration_weeks: Number,         // How many weeks has this been a problem? (1, 2, 4, 8, 12, 24+)
+  
+  // Screen 3 — Symptoms (Yes/No cards)
+  is_itchy: Boolean,              // KEY fungal signal
+  is_painful: Boolean,            // KEY nodular/cystic signal  
+  is_uniform_size: Boolean,       // KEY fungal signal (all same size?)
+  
+  // Screen 4 — Your Life
+  plays_sport_sweats: Boolean,    // fungal + acne mechanica signal
+  wears_daily_makeup: Boolean,    // comedogenic signal
+  stress_level: 1|2|3,           // Low / Medium / High (emoji scale for teens)
+  uses_oily_hair_products: Boolean, // KEY fungal signal
+  
+  // Screen 5 — Your History
+  tried_before: Array,            // Multi-select: ["nothing","basic_cleanser",
+                                  //   "salicylic_acid","benzoyl_peroxide",
+                                  //   "antibiotic_cream","retinoid","other"]
+  antibiotic_cream_no_improvement: Boolean, // "Did antibiotic cream NOT help?" → fungal flag
+  family_acne_history: "none" | "mild" | "moderate" | "severe",
+  
+  // Screen 6 — Cycle (only shown if biological_sex === "female")
+  tracks_cycle: Boolean,
+  cycle_stage: "period" | "week2" | "premenstrual" | "unsure" | null,
+  acne_worsens_before_period: Boolean | null,
+  
+  // Confounder capture (shown at follow-up, not initial)
+  other_changes_this_week: String | null  // "Did you change anything else this week?"
+};
+Open in CodePen 
+🤖 PART 3: MedGemma Prompt A — Initial Scan
+3a. System Prompt (goes in role: "system")
+You are a skin pattern analysis assistant for Pimple Lab, a teen skincare science app.
+
+Your job: analyse the skin photo provided and output a structured hypothesis about what type of skin pattern is visible. You are NOT making a medical diagnosis. You are identifying visible patterns to help a teenager design a skincare experiment.
+
+CRITICAL OUTPUT RULES:
+1. Respond with ONLY a valid JSON object. Zero text before or after it.
+2. Your very first character must be {
+3. Keep the "message" field under 50 words
+4. Keep the "hypothesis" field under 20 words
+5. If image quality is too poor to assess, still output JSON and set confidence to "low" and include "poor_image_quality" in flags
+
+OUTPUT EXACTLY THIS JSON STRUCTURE (no extra fields):
+{
+  "skin_tone": "[light or medium or dark — infer from image]",
+  "pattern": "[one of: clear, comedonal, papular, pustular, nodular, cystic, mixed]",
+  "severity": "[one of: clear, mild, moderate, severe, urgent]",
+  "zones": ["[array of: forehead, left_cheek, right_cheek, chin, nose, t_zone, chest, back]"],
+  "confidence": "[low or medium or high]",
+  "flags": ["[array — include any that apply: possible_fungal, hormonal_pattern, scarring_risk, pih_present, poor_image_quality]"],
+  "message": "[2-3 sentences, teen-friendly, hypothesis framing — 'Here's what we think we're seeing…']",
+  "hypothesis": "[one sentence: If this is X, then Y should improve in Z timeframe]",
+  "see_doctor": [true or false]
+}
+
+PATTERN DEFINITIONS (use these exactly):
+- clear: no visible active lesions
+- comedonal: primarily blackheads or closed bumps under skin, no redness
+- papular: small red raised bumps, no pus visible
+- pustular: red spots with visible white or yellow pus centres
+- nodular: large deep firm painful-looking bumps, no pus
+- cystic: large fluid-filled deep sacs, very inflamed
+- mixed: combination of two or more types above
+
+SEVERITY RULES:
+- clear: no lesions
+- mild: few scattered lesions, low inflammation
+- moderate: multiple lesions across one or more zones, visible redness
+- severe: many lesions, significant inflammation, possible early scarring
+- urgent: nodular or cystic pattern, risk of permanent scarring
+
+CONFIDENCE RULES:
+- high: image clear, multiple lesions visible and classifiable
+- medium: image acceptable but some ambiguity in lesion type
+- low: image too dark, blurry, zoomed too close/far, or only 1-2 ambiguous spots
+
+FUNGAL FLAG: Add "possible_fungal" to flags if the user context mentions any of:
+itchy spots, no improvement with antibiotic cream, uniform-sized bumps, sweaty sports + oily hair products
+
+URGENCY FLAG: Set see_doctor true AND severity urgent if nodular or cystic pattern visible, or more than 5 large deep lesions
+
+EXAMPLE OUTPUT (follow this format exactly, do not copy the values):
+{
+  "skin_tone": "medium",
+  "pattern": "pustular",
+  "severity": "moderate",
+  "zones": ["forehead", "chin"],
+  "confidence": "medium",
+  "flags": ["possible_fungal"],
+  "message": "Hey, so here's what we think we're seeing — your skin has quite a few inflamed spots with white centres, mainly on your forehead and chin. Given what you've told us about it being itchy and not budging with antibiotic cream, we're flagging a fungal possibility.",
+  "hypothesis": "If fungal acne, antifungal cleanser should show improvement in 2 weeks",
+  "see_doctor": false
+}
+3b. User Message Template (sent alongside image)
+javascript
+function buildInitialUserMessage(intake) {
+  return `
+Analyse the skin in this photo for a Pimple Lab experiment.
+
+USER CONTEXT:
+- Age: ${intake.age}
+- Biological sex: ${intake.biological_sex}
+- Main concern zones (self-reported): ${intake.concern_zones.join(", ")}
+- How long this has been a problem: ${intake.duration_weeks} weeks
+- Symptoms: itchy=${intake.is_itchy}, painful=${intake.is_painful}, all-same-size bumps=${intake.is_uniform_size}
+- Lifestyle: plays sport/sweats regularly=${intake.plays_sport_sweats}, wears daily makeup=${intake.wears_daily_makeup}, uses oily hair products=${intake.uses_oily_hair_products}
+- Stress level: ${["low","medium","high"][intake.stress_level - 1]}
+- Treatments tried before: ${intake.tried_before.join(", ")}
+- Antibiotic cream used but didn't help: ${intake.antibiotic_cream_no_improvement}
+- Family acne history: ${intake.family_acne_history}
+${intake.biological_sex === "female" ? `- Cycle stage: ${intake.cycle_stage || "not tracked"}, acne worsens before period: ${intake.acne_worsens_before_period}` : ""}
+
+Use the context above — especially itchy, uniform bumps, antibiotic cream failure, and sport+oily hair products — to inform whether "possible_fungal" should be flagged.
+
+Output ONLY the JSON. Begin immediately with {
+`.trim();
+}
+Open in CodePen 
+3c. Full HuggingFace API Request
+javascript
+async function callMedGemmaInitial(base64Image, intake, systemPrompt) {
+  const userMessage = buildInitialUserMessage(intake);
+  
+  const response = await fetch(process.env.HF_ENDPOINT_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.HF_API_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      inputs: {
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt   // SYSTEM_PROMPT_A from 3a above
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: `data:image/jpeg;base64,${base64Image}` }
+              },
+              {
+                type: "text",
+                text: userMessage
+              }
+            ]
+          }
+        ]
+      },
+      parameters: {
+        max_new_tokens: 300,
+        return_full_text: false,
+        temperature: 0.1,       // Low temp = more consistent JSON output
+        do_sample: false        // Greedy decode = more deterministic
+      }
+    })
+  });
+
+  const result = await response.json();
+  const rawText = result[0]?.generated_text || result?.generated_text || "";
+  return parseMedGemmaResponse(rawText);
+}
+Open in CodePen 
+💡 temperature: 0.1 and do_sample: false are critical. High temperature = creative prose = broken JSON. Keep it deterministic.
+
+🔁 PART 4: MedGemma Prompt B — Follow-up Comparison
+4a. System Prompt Delta (add to top of Part 3a system prompt)
+ADDITIONAL CONTEXT FOR FOLLOW-UP SCANS:
+You will be given the original baseline assessment as text. The photo provided is the CURRENT state of the user's skin. Compare current photo to the baseline description and assess whether the skin has improved, stayed the same, or worsened. You cannot see the original photo — use the current photo and the text description of what was seen before.
+4b. User Message Template (Follow-up)
+javascript
+function buildFollowUpUserMessage(intake, baseline, experiment) {
+  return `
+This is a follow-up skin check for a Pimple Lab experiment. The user has been running a routine for ${experiment.days_elapsed} days.
+
+ORIGINAL BASELINE (${experiment.days_elapsed} days ago):
+- Pattern identified: ${baseline.pattern}
+- Severity: ${baseline.severity}  
+- Zones affected: ${baseline.zones.join(", ")}
+- Hypothesis being tested: "${experiment.hypothesis}"
+- Routine followed: ${experiment.routine_description}
+- Adherence (self-reported): ${experiment.adherence_percent}% of days
+
+CURRENT USER CONTEXT:
+- Age: ${intake.age}
+- Biological sex: ${intake.biological_sex}
+- Any other changes this week (confounders): ${intake.other_changes_this_week || "none reported"}
+- Stress level this week: ${["low","medium","high"][intake.stress_level - 1]}
+${intake.biological_sex === "female" ? `- Cycle stage: ${intake.cycle_stage || "not tracked"}` : ""}
+
+Analyse the CURRENT skin photo. Compare to baseline. Output ONLY this JSON:
+{
+  "skin_tone": "[light or medium or dark]",
+  "current_pattern": "[clear, comedonal, papular, pustular, nodular, cystic, mixed]",
+  "current_severity": "[clear, mild, moderate, severe, urgent]",
+  "change": "[much_better, better, same, worse, much_worse]",
+  "confidence": "[low, medium, high]",
+  "flags": ["[any relevant flags]"],
+  "message": "[2-3 sentences, teen-friendly, compare to before — under 50 words]",
+  "next_step": "[one sentence — what to do next, under 15 words]",
+  "see_doctor": [true or false]
+}
+
+Begin immediately with {
+`.trim();
+}
+Open in CodePen 
+🛠️ PART 5: Text Parser — Robust Fallback (JavaScript)
+javascript
+/**
+ * parseMedGemmaResponse
+ * Tries 4 strategies in order. Always returns a usable object.
+ */
+function parseMedGemmaResponse(rawText) {
+  if (!rawText || rawText.trim() === "") {
+    return { success: false, data: getFallbackObject("empty_response"), method: "empty" };
+  }
+
+  const cleaned = rawText.trim();
+
+  // Strategy 1: Direct JSON parse
+  try {
+    const data = JSON.parse(cleaned);
+    if (isValidMedGemmaJSON(data)) {
+      return { success: true, data, method: "direct" };
+    }
+  } catch (e) {}
+
+  // Strategy 2: Extract first complete {...} block
+  const jsonBlockMatch = cleaned.match(/\{[\s\S]*?\}(?=\s*$|\s*\n)/);
+  if (!jsonBlockMatch) {
+    // Try greedy match for nested structures
+    const greedyMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (greedyMatch) {
+      try {
+        const data = JSON.parse(greedyMatch[0]);
+        if (isValidMedGemmaJSON(data)) {
+          return { success: true, data, method: "extracted_greedy" };
+        }
+      } catch (e) {}
+    }
+  } else {
+    try {
+      const data = JSON.parse(jsonBlockMatch[0]);
+      if (isValidMedGemmaJSON(data)) {
+        return { success: true, data, method: "extracted" };
+      }
+    } catch (e) {}
+  }
+
+  // Strategy 3: Strip markdown code fences
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (codeBlockMatch) {
+    try {
+      const data = JSON.parse(codeBlockMatch[1].trim());
+      if (isValidMedGemmaJSON(data)) {
+        return { success: true, data, method: "markdown" };
+      }
+    } catch (e) {}
+  }
+
+  // Strategy 4: Truncated JSON repair (MedGemma hit token limit mid-JSON)
+  const truncatedRepair = repairTruncatedJSON(cleaned);
+  if (truncatedRepair) {
+    return { success: true, data: truncatedRepair, method: "repaired", warning: "truncated" };
+  }
+
+  // Strategy 5: Full prose keyword extraction
+  return { success: true, data: extractFromProse(cleaned), method: "prose_fallback" };
+}
+
+/**
+ * Validate minimum required fields exist
+ */
+function isValidMedGemmaJSON(data) {
+  return data && 
+    typeof data === "object" && 
+    data.pattern && 
+    data.severity && 
+    data.confidence;
+}
+
+/**
+ * Attempt to repair JSON truncated by token limit
+ * Adds missing closing brackets and sanitises incomplete string values
+ */
+function repairTruncatedJSON(text) {
+  try {
+    // Find the last complete field before truncation
+    let json = text;
+    
+    // Strip anything after the last complete value (comma or closing bracket)
+    json = json.replace(/,\s*"[^"]*"\s*:\s*[^,}\]]*$/, ""); // Remove incomplete last field
+    json = json.replace(/,\s*"[^"]*"\s*$/, "");               // Remove dangling key
+    json = json.replace(/"[^"]*$/, '"[truncated]"');           // Close open string
+    
+    // Count brackets and close them
+    const openBraces = (json.match(/\{/g) || []).length;
+    const closeBraces = (json.match(/\}/g) || []).length;
+    const openBrackets = (json.match(/\[/g) || []).length;
+    const closeBrackets = (json.match(/\]/g) || []).length;
+    
+    json += "]".repeat(Math.max(0, openBrackets - closeBrackets));
+    json += "}".repeat(Math.max(0, openBraces - closeBraces));
+    
+    const data = JSON.parse(json);
+    if (isValidMedGemmaJSON(data)) return data;
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * Pure prose fallback — keyword extraction
+ * Returns a minimal, honest object when all JSON strategies fail
+ */
+function extractFromProse(text) {
+  const lower = text.toLowerCase();
+
+  // Pattern detection (order matters — most severe first)
+  let pattern = "mixed";
+  if (lower.match(/cyst/)) pattern = "cystic";
+  else if (lower.match(/nodule|nodular/)) pattern = "nodular";
+  else if (lower.match(/pustule|pustular|pus-filled|whitehead.*inflam|pus/)) pattern = "pustular";
+  else if (lower.match(/papule|papular|red bump/)) pattern = "papular";
+  else if (lower.match(/comedone|blackhead|whitehead|blocked pore|clogged/)) pattern = "comedonal";
+  else if (lower.match(/clear|no (active|visible) lesion|no acne|healthy/)) pattern = "clear";
+
+  // Severity detection
+  let severity = "moderate";
+  if (pattern === "cystic" || pattern === "nodular") severity = "urgent";
+  else if (lower.match(/\burgent\b|\bsevere\b|\bsignificant\b|\bextensive\b|\bwidespread\b/)) severity = "severe";
+  else if (lower.match(/\bmild\b|\bminimal\b|\bfew\b|\bscattered\b|\boccasional\b/)) severity = "mild";
+  else if (lower.match(/\bclear\b|no lesion|no acne/)) severity = "clear";
+
+  // Zone detection
+  const zones = [];
+  if (lower.includes("forehead")) zones.push("forehead");
+  if (lower.includes("left cheek")) zones.push("left_cheek");
+  if (lower.includes("right cheek")) zones.push("right_cheek");
+  if (lower.includes("cheek") && !lower.includes("left cheek") && !lower.includes("right cheek")) {
+    zones.push("left_cheek", "right_cheek");
+  }
+  if (lower.match(/\bchin\b|\bjaw/)) zones.push("chin");
+  if (lower.match(/\bnose\b|t-zone|t zone/)) zones.push("nose");
+  if (lower.includes("chest")) zones.push("chest");
+  if (lower.includes("back")) zones.push("back");
+  if (zones.length === 0) zones.push("face"); // fallback
+
+  // Confidence — prose fallback is always lower
+  let confidence = "low";
+  if (lower.match(/\bclearly\b|\bdefinitely\b|\bconfident\b/)) confidence = "medium";
+
+  // Flags
+  const flags = ["poor_image_quality"]; // Always flag prose fallback
+  if (lower.match(/\bfungal\b|\bmalassezia\b|\bfolliculitis\b/)) flags.push("possible_fungal");
+  if (lower.match(/\bhormonal\b/)) flags.push("hormonal_pattern");
+  if (lower.match(/\bscar/)) flags.push("scarring_risk");
+  if (lower.match(/hyperpigment|dark spot|pih|post-inflammatory/)) flags.push("pih_present");
+
+  // Skin tone
+  let skin_tone = "medium";
+  if (lower.match(/\bfair\b|\blight skin\b|\bpale\b/)) skin_tone = "light";
+  if (lower.match(/\bdark skin\b|\bdeep(er)? skin\b|\bmelanin-rich\b/)) skin_tone = "dark";
+
+  const see_doctor = ["urgent", "severe"].includes(severity) || 
+                     ["cystic", "nodular"].includes(pattern);
+
+  return {
+    skin_tone,
+    pattern,
+    severity,
+    zones,
+    confidence,
+    flags,
+    message: "We had a bit of trouble reading the photo clearly — try retaking it in better lighting for a sharper result. Here's our best guess based on what we could see.",
+    hypothesis: "Results are uncertain — see suggestions below",
+    see_doctor,
+    _method: "prose_fallback"
+  };
+}
+Open in CodePen 
+🧬 PART 6: Rule-Based Hypothesis Engine
+javascript
+/**
+ * generateExperiment
+ * Input: MedGemma parsed output + intake form data
+ * Output: Full experiment plan the teen can follow
+ */
+function generateExperiment(medgemma, intake) {
+  const { pattern, severity, zones, flags, skin_tone } = medgemma;
+  const {
+    biological_sex, is_itchy, antibiotic_cream_no_improvement,
+    plays_sport_sweats, uses_oily_hair_products, is_uniform_size,
+    cycle_stage, acne_worsens_before_period, tried_before
+  } = intake;
+
+  // ── URGENT: Refer to doctor immediately ──────────────────────────────
+  if (severity === "urgent" || ["cystic", "nodular"].includes(pattern)) {
+    return {
+      type: "urgent",
+      title: "🚨 This needs a doctor, not an experiment",
+      hypothesis: "Over-the-counter products won't be enough for this level of acne",
+      message: "Based on what we can see, this looks like it could cause permanent scarring if it's not treated properly. Please see a GP or dermatologist as soon as you can — ideally this week. Don't leave this one.",
+      experiment_valid: false,
+      duration_days: null,
+      products: [],
+      see_doctor: true
+    };
+  }
+
+  // ── FUNGAL pathway ────────────────────────────────────────────────────
+  const fungalScore = [
+    flags.includes("possible_fungal"),
+    is_itchy,
+    antibiotic_cream_no_improvement,
+    is_uniform_size,
+    plays_sport_sweats && uses_oily_hair_products,
+    zones.includes("forehead") && is_uniform_size
+  ].filter(Boolean).length;
+
+  if (fungalScore >= 2) {
+    return {
+      type: "fungal",
+      title: "Hypothesis: Could this be fungal acne?",
+      hypothesis: "If this is fungal (Malassezia), an antifungal cleanser should improve it in 2 weeks",
+      explanation: "Fungal acne isn't caused by bacteria — it's a yeast that lives on skin and loves warm, sweaty environments. That's why antibiotic creams won't touch it, and why spots that look like pimples might actually be fungal folliculitis.",
+      experiment_question: "Will switching to an antifungal cleanser clear these spots in 14 days?",
+      duration_days: 14,
+      purge_warning: false,
+      products: [
+        {
+          step: "AM + PM Cleanser",
+          name: "Ketoconazole 1% shampoo (e.g. Nizoral)",
+          instruction: "Lather it onto your face (or affected area), leave for 3 minutes, then rinse. Once daily for 14 days.",
+          budget: "£8–12 at boots/pharmacy"
+        },
+        {
+          step: "Moisturiser",
+          name: "Light oil-free gel moisturiser",
+          instruction: "After cleansing. Keep this minimal — heavy creams can feed the fungus.",
+          budget: "Any non-comedogenic option"
+        }
+      ],
+      avoid: [
+        "Antibiotic creams or gels (won't help, may worsen)",
+        "Heavy moisturisers or oils on the affected area",
+        "Oily hair products that touch your forehead or back"
+      ],
+      routine_tips: [
+        "Change your pillowcase every 2–3 days",
+        "Shower after sport — don't let sweat sit on skin",
+        "Keep hair products away from your hairline"
+      ],
+      check_in_prompt: "Same angle, same light. Have the spots reduced in size or number? Still itchy?",
+      see_doctor: false
+    };
+  }
+
+  // ── HORMONAL pathway ──────────────────────────────────────────────────
+  const hormonalZones = ["chin", "left_cheek", "right_cheek"];
+  const isHormonal = biological_sex === "female" &&
+    zones.some(z => hormonalZones.includes(z)) &&
+    (acne_worsens_before_period || flags.includes("hormonal_pattern"));
+
+  if (isHormonal) {
+    return {
+      type: "hormonal",
+      title: "Hypothesis: Could this be hormonal acne?",
+      hypothesis: "If this is hormonal, tracking your cycle should reveal a pattern in 28 days",
+      explanation: "Hormonal acne clusters on the lower face — chin, jaw, cheeks — and often flares in the 2 weeks before your period. This isn't random. It follows a pattern, and once you see it, you can plan around it.",
+      experiment_question: "Does your skin consistently worsen in the 2 weeks before your period?",
+      duration_days: 28,
+      purge_warning: false,
+      products: [
+        {
+          step: "AM — after cleansing",
+          name: "Niacinamide 10% serum (e.g. The Ordinary)",
+          instruction: "Apply to whole face. Reduces oil and calms redness.",
+          budget: "£5–8"
+        },
+        {
+          step: "PM — after cleansing",
+          name: "Azelaic acid 10% (e.g. The Ordinary or Paula's Choice)",
+          instruction: "Apply to chin/jawline area. Fights bacteria AND fades dark marks.",
+          budget: "£7–15"
+        },
+        {
+          step: "AM + PM",
+          name: "Gentle non-comedogenic cleanser",
+          instruction: "Wash twice daily. Don't scrub.",
+          budget: "CeraVe or Simple — £5–8"
+        }
+      ],
+      avoid: [
+        "Heavy foundation or concealer on the jawline if possible",
+        "Dairy (some evidence it worsens hormonal acne — experiment with cutting it if you want a second hypothesis)",
+        "Changing multiple things at once — this experiment tracks ONE variable"
+      ],
+      routine_tips: [
+        "Log your cycle stage every time you do a check-in",
+        "Take your follow-up photo on the same cycle day as your baseline",
+        "Full cycle = 28 days. Don't judge at 2 weeks."
+      ],
+      check_in_prompt: "Where are you in your cycle? Have spots on your chin/jaw changed?",
+      note: "⚠️ Hormonal acne needs more than 14 days to judge — come back at the 4-week mark.",
+      see_doctor: false
+    };
+  }
+
+  // ── COMEDONAL pathway ─────────────────────────────────────────────────
+  if (pattern === "comedonal") {
+    return {
+      type: "comedonal",
+      title: "Hypothesis: Blocked pores are the main issue",
+      hypothesis: "If these are blocked pores, adapalene should reduce new ones in 6 weeks",
+      explanation: "Blackheads and closed bumps under the skin form when pores get plugged with sebum and dead skin cells. A retinoid (like adapalene) speeds up skin cell turnover so pores don't block in the first place — but it takes 6 weeks to see results.",
+      experiment_question: "Will adapalene 0.1% reduce new blackheads and under-skin bumps in 42 days?",
+      duration_days: 42,
+      purge_warning: true,
+      purge_message: "⚠️ IMPORTANT — The Purge: Your skin may look WORSE in weeks 1–3 with adapalene. This is normal and means it's working. Don't stop. If you quit during the purge, you'll never know if it would have worked.",
+      products: [
+        {
+          step: "PM — every other night for first 2 weeks, then nightly",
+          name: "Adapalene 0.1% gel (Differin — available OTC in UK/US)",
+          instruction: "Apply a pea-sized amount to CLEAN DRY skin. Avoid eye area. Moisturise on top.",
+          budget: "£12–18"
+        },
+        {
+          step: "AM + PM",
+          name: "Gentle non-comedogenic cleanser",
+          instruction: "Don't scrub. Rinse with lukewarm water.",
+          budget: "£5–8"
+        },
+        {
+          step: "AM — every day",
+          name: "SPF 30+ sunscreen (non-comedogenic)",
+          instruction: "Non-negotiable with retinoids. They increase sun sensitivity.",
+          budget: "La Roche-Posay SPF50 — £15, or any non-comedogenic SPF"
+        }
+      ],
+      avoid: [
+        "Pore-clogging ingredients: coconut oil, cocoa butter, shea butter, lanolin",
+        "Physical scrubs or exfoliators — these make retinoid irritation worse",
+        "Vitamin C serum on nights you use adapalene — causes irritation"
+      ],
+      check_in_prompt: "Any new spots? Compare the texture of your skin to before. Has the sandpaper feeling reduced?",
+      see_doctor: false
+    };
+  }
+
+  // ── PUSTULAR / BACTERIAL pathway ──────────────────────────────────────
+  if (["pustular", "papular"].includes(pattern)) {
+    return {
+      type: "bacterial",
+      title: "Hypothesis: Active bacterial inflammatory acne",
+      hypothesis: "If this is bacterial acne, BPO + adapalene combo should reduce spots in 3 weeks",
+      explanation: "Those inflamed spots with pus? They're caused by C. acnes bacteria getting trapped in a blocked pore and triggering inflammation. BPO kills the bacteria fast. Adapalene stops the blockage from forming in the first place. They're a power duo.",
+      experiment_question: "Will BPO + adapalene visibly reduce active spots in 21 days?",
+      duration_days: 21,
+      purge_warning: false,
+      products: [
+        {
+          step: "AM — as face wash",
+          name: "Benzoyl peroxide 2.5–5% wash (e.g. PanOxyl, Brevoxyl)",
+          instruction: "Lather onto damp skin, leave 1–2 minutes, rinse. Start every other day for week 1 to avoid over-drying.",
+          budget: "£6–12"
+        },
+        {
+          step: "PM — on clean dry skin",
+          name: "Adapalene 0.1% gel (Differin)",
+          instruction: "Thin layer over affected area. Wait 10 minutes after washing before applying.",
+          budget: "£12–18"
+        },
+        {
+          step: "AM + PM",
+          name: "Light oil-free moisturiser",
+          instruction: "After BPO wash (AM) and after adapalene (PM). Keeps barrier healthy.",
+          budget: "CeraVe PM lotion — £10–14"
+        }
+      ],
+      avoid: [
+        "BPO bleaches fabric — use a white pillowcase and white towel while on this routine",
+        "Scrubbing spots or picking pimples — causes scarring and spreads bacteria",
+        "Mixing with other actives (AHA, BHA, Vitamin C) in same routine — too much irritation"
+      ],
+      ...(skin_tone === "dark" ? {
+        skin_tone_note: "Note: On darker skin tones, healed spots can leave dark marks (PIH). Azelaic acid or niacinamide can help fade these — consider adding in week 3 if spots are improving."
+      } : {}),
+      check_in_prompt: "Count the active spots with pus. Have they reduced? Are new spots still forming?",
+      see_doctor: false
+    };
+  }
+
+  // ── MIXED / UNCLEAR pathway ───────────────────────────────────────────
+  return {
+    type: "mixed",
+    title: "Hypothesis: Multiple things going on — tackle the most active first",
+    hypothesis: "BPO + adapalene combo should reduce active spots in 3 weeks",
+    explanation: "When different types of spots are happening at once, we start with the duo most likely to address both inflammation and blockage. Keep it simple — one routine, 3 weeks, then reassess.",
+    experiment_question: "Will this standard combination reduce overall spot activity in 21 days?",
+    duration_days: 21,
+    purge_warning: false,
+    products: [
+      {
+        step: "AM",
+        name: "BPO 2.5% wash",
+        instruction: "Lather, 1 min, rinse. Start every other day.",
+        budget: "£6–12"
+      },
+      {
+        step: "PM",
+        name: "Adapalene 0.1% gel",
+        instruction: "Thin layer on affected areas. Whole face if widespread.",
+        budget: "£12–18"
+      },
+      {
+        step: "AM + PM",
+        name: "Non-comedogenic moisturiser + SPF (AM only)",
+        instruction: "Don't skip moisturiser — especially with BPO + retinoid.",
+        budget: "£10–18 total"
+      }
+    ],
+    avoid: ["Changing multiple products at the same time — one variable only"],
+    check_in_prompt: "Overall, does your skin feel calmer? Are there fewer active spots?",
+    see_doctor: false
+  };
+}
+Open in CodePen 
+📊 PART 7: Confidence Score Calculator
+javascript
+/**
+ * Calculates an overall confidence % for display to the user
+ * Capped at 90% — this is never a medical diagnosis
+ */
+function calculateConfidenceScore(medgemma, intake, parseMethod) {
+  let score = 0;
+
+  // MedGemma self-reported confidence
+  const confMap = { high: 35, medium: 22, low: 8 };
+  score += confMap[medgemma.confidence] || 10;
+
+  // Image quality
+  if (!medgemma.flags.includes("poor_image_quality")) score += 20;
+  else score -= 5;
+
+  // Parse method quality
+  const parseMap = {
+    direct: 20,
+    extracted: 18,
+    extracted_greedy: 15,
+    markdown: 15,
+    repaired: 8,
+    prose_fallback: 0
+  };
+  score += parseMap[parseMethod] || 0;
+
+  // Intake data completeness (each field worth ~1.5 pts, max 15)
+  const keyFields = ["age","biological_sex","concern_zones","is_itchy","is_painful",
+                     "is_uniform_size","duration_weeks","tried_before","family_acne_history"];
+  const filled = keyFields.filter(f => 
+    intake[f] !== null && intake[f] !== undefined && intake[f] !== ""
+  ).length;
+  score += Math.round((filled / keyFields.length) * 15);
+
+  // Pattern specificity (mixed = less certain)
+  if (medgemma.pattern !== "mixed" && medgemma.pattern !== "unclear") score += 8;
+
+  // Truncation/fallback penalty
+  if (medgemma._method === "prose_fallback") score -= 15;
+
+  // Hard cap: never claim 100%
+  return Math.min(Math.max(Math.round(score), 12), 90);
+}
+Open in CodePen 
+💬 PART 8: Output Formatter — Teen-Friendly Message Assembler
+javascript
+/**
+ * Assembles the final card shown to the teen
+ * Pulls from MedGemma output + experiment engine
+ */
+function formatResultCard(medgemma, experiment, confidenceScore, parseMethod) {
+  const isUncertain = confidenceScore < 40 || medgemma.flags.includes("poor_image_quality");
+  const isFallback = parseMethod === "prose_fallback";
+
+  const card = {
+    // Header
+    title: experiment.title,
+    confidence_percent: confidenceScore,
+    confidence_label: confidenceScore >= 70 ? "Good signal" 
+                    : confidenceScore >= 45 ? "Uncertain — use as a starting point" 
+                    : "Low confidence — try a clearer photo",
+
+    // What we see
+    what_we_see: medgemma.message,
+
+    // Legal/ethical disclaimer (always shown)
+    disclaimer: "This is our best hypothesis — not a medical diagnosis. Use it as a starting point for your experiment, not as medical advice.",
+
+    // Poor image warning
+    ...(isUncertain ? {
+      image_warning: "📷 The photo quality made this harder to assess. Try retaking in brighter lighting for a sharper result next time."
+    } : {}),
+
+    // The experiment
+    hypothesis: experiment.hypothesis,
+    experiment_question: experiment.experiment_question,
+    duration_days: experiment.duration_days,
+    check_in_date: experiment.duration_days 
+      ? new Date(Date.now() + experiment.duration_days * 86400000).toLocaleDateString("en-GB") 
+      : null,
+
+    // Purge warning (if retinoid)
+    ...(experiment.purge_warning ? {
+      purge_warning: experiment.purge_message
+    } : {}),
+
+    // Products
+    products: experiment.products,
+    avoid: experiment.avoid,
+    tips: experiment.routine_tips || [],
+
+    // Skin tone specific note
+    ...(medgemma.skin_tone === "dark" && experiment.skin_tone_note ? {
+      skin_tone_note: experiment.skin_tone_note
+    } : {}),
+
+    // Check-in prompt
+    check_in_prompt: experiment.check_in_prompt,
+
+    // Urgent escalation
+    see_doctor: medgemma.see_doctor || experiment.see_doctor,
+    ...(medgemma.see_doctor || experiment.see_doctor ? {
+      doctor_message: "🚨 Based on what we can see, please see a GP or dermatologist soon. This level of acne can cause permanent scarring — get professional help before trying to treat it yourself."
+    } : {})
+  };
+
+  return card;
+}
+Open in CodePen 
+🔗 PART 9: Integration Notes for Replit
+Complete call flow (server-side, e.g. server.js):
+javascript
+app.post("/api/analyse", upload.single("photo"), async (req, res) => {
+  try {
+    // 1. Get intake data
+    const intake = JSON.parse(req.body.intake);
+
+    // 2. Image is already resized/compressed by your existing middleware
+    const base64Image = req.file.buffer.toString("base64");
+
+    // 3. Call MedGemma
+    const rawResponse = await callMedGemmaInitial(base64Image, intake, SYSTEM_PROMPT_A);
+
+    // 4. Parse response
+    const { success, data: medgemma, method: parseMethod } = parseMedGemmaResponse(rawResponse);
+
+    // 5. Generate experiment plan
+    const experiment = generateExperiment(medgemma, intake);
+
+    // 6. Calculate confidence
+    const confidenceScore = calculateConfidenceScore(medgemma, intake, parseMethod);
+
+    // 7. Format result card
+    const card = formatResultCard(medgemma, experiment, confidenceScore, parseMethod);
+
+    // 8. Store in DB (for longitudinal tracking)
+    await saveSnapshot({
+      user_id: req.user.id,
+      scan_type: "initial",
+      medgemma_raw: medgemma,
+      experiment,
+      confidence: confidenceScore,
+      intake,
+      timestamp: new Date()
+    });
+
+    res.json({ success: true, card, experiment_id: newSnapshot.id });
+
+  } catch (err) {
+    console.error("Analysis error:", err);
+    res.status(500).json({ 
+      success: false, 
+      error: "Analysis failed — please try again",
+      card: getFallbackCard()  // Always show something
+    });
+  }
+});
+Open in CodePen 
+Environment variables needed in Replit Secrets:
+HF_ENDPOINT_URL = https://api-inference.huggingface.co/models/[your-medgemma-endpoint]
+HF_API_TOKEN = hf_...your token...
+Timeout handling:
+javascript
+// Add timeout to MedGemma call — L4 GPU can occasionally spike
+const controller = new AbortController();
+const timeout = setTimeout(() => controller.abort(), 90000); // 90s max
+// pass signal: controller.signal to fetch
+Open in CodePen 
+📐 Architecture Summary
+USER FLOW
+─────────────────────────────────────────────────────────────
+Intake Form (8 screens) → Photo Capture (≤3 attempts)
+        ↓
+Server: resize → 512x512 / 70% JPEG / base64
+        ↓
+MedGemma 1.5 4B-it (max_new_tokens: 300, temp: 0.1)
+        ↓
+Text Parser (4-strategy cascade)
+        ↓
+Hypothesis Engine (rule-based, 6 pathways)
+        ↓
+Confidence Calculator (intake + parse quality + image quality)
+        ↓
+Result Card (teen-friendly, experiment-framed, not a diagnosis)
+        ↓
+Save to DB → Follow-up reminder in X days
+─────────────────────────────────────────────────────────────
+
+6 HYPOTHESIS PATHWAYS:
+  1. 🚨 Urgent (nodular/cystic) → Doctor referral
+  2. 🍄 Fungal (≥2 signals)     → Antifungal, 14 days
+  3. 🔴 Hormonal (female, jaw)  → Cycle tracking, 28 days
+  4. ⚫ Comedonal               → Adapalene, 42 days + purge warning
+  5. 🟡 Bacterial pustular      → BPO + Adapalene, 21 days
+  6. 🔀 Mixed/unclear           → BPO + Adapalene, 21 days
+Everything above is copy-paste ready for Replit. The system prompt goes into a SYSTEM_PROMPT_A constant, all the JavaScript functions drop straight into your backend, and the intake schema maps directly to your form.
+
+You're building for Feb 23. Ship the core loop first: Photo → Parse → Hypothesis → Card → DB save. The follow-up comparison (Prompt B) can go in immediately after — it reuses 80% of the same code. 🚀
